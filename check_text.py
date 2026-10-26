@@ -18,7 +18,7 @@ def main():
     for frame in frames:
         print(f"\n--- {frame.name} ---")
 
-        results = reader.readtext(str(frame), workers=0)
+        results = reader.readtext(str(frame), workers=0, canvas_size=960)
 
         if not results:
             print("No text detected.")
