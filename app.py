@@ -1,3 +1,8 @@
+import cProfile
+import io
+import pstats
+import time
+
 import streamlit as st
 
 st.set_page_config(
@@ -21,10 +26,27 @@ navigation = st.navigation([
 ])
 
 with st.sidebar:
-    st.caption(
-        "Visual search finds similar scenes. "
-        "Text search finds words on screen. "
-        "Speech search finds spoken words."
-    )
+    diagnose = st.checkbox("Measure page speed", value=True)
 
-navigation.run()
+if diagnose:
+    profiler = cProfile.Profile()
+    start = time.perf_counter()
+    profiler.enable()
+
+    try:
+        navigation.run()
+    finally:
+        profiler.disable()
+        elapsed = time.perf_counter() - start
+
+        report = io.StringIO()
+        stats = pstats.Stats(profiler, stream=report)
+        stats.strip_dirs().sort_stats("cumulative").print_stats(20)
+
+        with st.sidebar:
+            st.metric("Python page execution", f"{elapsed:.1f} seconds")
+
+            with st.expander("Timing details", expanded=True):
+                st.code(report.getvalue(), language="text")
+else:
+    navigation.run()
