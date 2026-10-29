@@ -3,15 +3,21 @@ import json
 from pathlib import Path
 
 import streamlit as st
-from faster_whisper import WhisperModel
 
 st.set_page_config(page_title="FrameSeek Speech", layout="wide")
 
+SEARCH_MODEL = (
+    "sentence-transformers/"
+    "paraphrase-multilingual-MiniLM-L12-v2"
+)
+
 
 @st.cache_resource
-def load_model(model_size):
+def load_transcriber(size):
+    from faster_whisper import WhisperModel
+
     return WhisperModel(
-        model_size,
+        size,
         device="cpu",
         compute_type="int8",
         cpu_threads=2,
@@ -19,24 +25,82 @@ def load_model(model_size):
     )
 
 
-def timestamp(seconds):
+@st.cache_resource
+def load_search_model():
+    import torch
+    from sentence_transformers import SentenceTransformer
+
+    torch.set_num_threads(2)
+    return SentenceTransformer(SEARCH_MODEL, device="cpu")
+
+
+def label(seconds):
     minutes, seconds = divmod(int(seconds), 60)
     return f"{minutes:02d}:{seconds:02d}"
 
 
-st.title("FrameSeek — Speech Search")
-st.caption("Find words and phrases spoken in your video.")
+def semantic_search(records, query, index_dir):
+    import numpy as np
 
-upload = st.file_uploader("Upload an MP4", type=["mp4"])
+    texts = [record["text"] for record in records]
+
+    # Changed transcripts or models get a separate embedding file.
+    signature = hashlib.sha256(
+        json.dumps(
+            {"model": SEARCH_MODEL, "texts": texts},
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+    embedding_path = index_dir / f"semantic_{signature}.npy"
+    model = load_search_model()
+
+    if embedding_path.exists():
+        embeddings = np.load(embedding_path, allow_pickle=False)
+    else:
+        embeddings = model.encode(
+            texts,
+            batch_size=16,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+        temporary_path = embedding_path.with_suffix(".tmp")
+
+        with temporary_path.open("wb") as output:
+            np.save(output, embeddings)
+
+        temporary_path.replace(embedding_path)
+
+    query_embedding = model.encode(
+        query,
+        normalize_embeddings=True,
+    )
+
+    scores = embeddings @ query_embedding
+    positions = np.argsort(scores)[::-1][:5]
+
+    return [
+        {
+            **records[int(position)],
+            "detail": f"Similarity: {scores[position]:.3f}",
+        }
+        for position in positions
+    ]
+
+
+st.title("FrameSeek — Speech Search")
+st.caption("Find exact words or search the meaning of the commentary.")
+
+upload = st.file_uploader(
+    "Upload an MP4",
+    type=["mp4"],
+    key="speech_upload",
+)
 
 if upload is None:
     st.stop()
 
-model_size = st.selectbox(
-    "Model",
-    ["tiny", "base"],
-    help="Start with tiny. Base may improve accuracy but takes longer.",
-)
+size = st.selectbox("Transcription model", ["tiny", "base"])
 
 language_name = st.selectbox(
     "Spoken language",
@@ -63,8 +127,7 @@ video_path = video_dir / "video.mp4"
 if not video_path.exists():
     video_path.write_bytes(video_bytes)
 
-# Separate transcripts for each model and language setting.
-settings = f"{model_size}_{language or 'auto'}"
+settings = f"{size}_{language or 'auto'}"
 transcript_path = index_dir / f"speech_{settings}.json"
 play_key = f"speech_play_{video_id}"
 
@@ -73,7 +136,7 @@ if st.button("Transcribe speech", type="primary"):
 
     try:
         with st.spinner("Loading model and transcribing..."):
-            model = load_model(model_size)
+            model = load_transcriber(size)
 
             segments, info = model.transcribe(
                 str(video_path),
@@ -85,7 +148,6 @@ if st.button("Transcribe speech", type="primary"):
 
             records = []
 
-            # Transcription happens as we iterate over segments.
             for segment in segments:
                 text = segment.text.strip()
 
@@ -97,20 +159,20 @@ if st.button("Transcribe speech", type="primary"):
                     })
 
                 status.info(
-                    f"Transcribed through {timestamp(segment.end)}"
+                    f"Transcribed through {label(segment.end)}"
                 )
 
-            transcript_path.write_text(
-                json.dumps(
-                    {
-                        "language": info.language,
-                        "segments": records,
-                    },
-                    indent=2,
-                    ensure_ascii=False,
-                ),
+            payload = {
+                "language": info.language,
+                "segments": records,
+            }
+
+            temporary_path = transcript_path.with_suffix(".tmp")
+            temporary_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            temporary_path.replace(transcript_path)
 
         status.success("Transcript saved.")
 
@@ -120,37 +182,87 @@ if st.button("Transcribe speech", type="primary"):
 player = st.empty()
 
 if transcript_path.exists():
-    transcript = json.loads(
-        transcript_path.read_text(encoding="utf-8")
-    )
+    transcript_bytes = transcript_path.read_bytes()
+    transcript = json.loads(transcript_bytes)
     records = transcript["segments"]
+
+    # Results belong to this exact transcript.
+    transcript_id = hashlib.sha256(transcript_bytes).hexdigest()
+    results_key = f"speech_results_{video_id}_{transcript_id}"
 
     st.caption(f"Transcript language: {transcript['language']}")
 
-    query = st.text_input(
-        "Search spoken words",
-        placeholder="Enter a word or phrase from the commentary",
-    ).strip()
+    with st.form("speech_search_form"):
+        mode = st.radio(
+            "Search mode",
+            ["Exact words", "Search by meaning"],
+            horizontal=True,
+        )
 
-    matches = [
-        record
-        for record in records
-        if query.casefold() in record["text"].casefold()
-    ] if query else []
+        query = st.text_input(
+            "Search",
+            placeholder="A name, phrase, or description",
+        ).strip()
 
-    if query and not matches:
-        st.info("No matching words found in the transcript.")
+        submitted = st.form_submit_button("Search")
 
-    for i, record in enumerate(matches):
-        with st.container(border=True):
-            st.write(
-                f"**{timestamp(record['start'])}** — {record['text']}"
+    if submitted:
+        matches = []
+
+        if query and records:
+            if mode == "Exact words":
+                matches = [
+                    {**record, "detail": "Text match"}
+                    for record in records
+                    if query.casefold() in record["text"].casefold()
+                ]
+            else:
+                try:
+                    with st.spinner(
+                        "Loading search model and comparing meanings..."
+                    ):
+                        matches = semantic_search(
+                            records, query, index_dir
+                        )
+                except Exception as error:
+                    st.error(f"Semantic search failed: {error}")
+
+        st.session_state[results_key] = {
+            "matches": matches,
+            "mode": mode,
+            "query": query,
+        }
+
+    saved = st.session_state.get(results_key)
+
+    if saved and saved["query"]:
+        st.write(f"Results for: **{saved['query']}**")
+
+        if saved["mode"] == "Search by meaning":
+            st.caption(
+                "These are the closest transcript segments, "
+                "even if none answers your query. "
+                "Scores are not confidence percentages."
             )
 
-            if st.button("Jump here", key=f"speech_result_{i}"):
-                st.session_state[play_key] = max(
-                    0, int(record["start"]) - 1
+        if not saved["matches"]:
+            st.info("No matches found.")
+
+        for i, record in enumerate(saved["matches"]):
+            with st.container(border=True):
+                st.write(
+                    f"**{label(record['start'])}**"
+                    f" — {record['text']}"
                 )
+                st.caption(record["detail"])
+
+                if st.button(
+                    "Jump here",
+                    key=f"{results_key}_{i}",
+                ):
+                    st.session_state[play_key] = max(
+                        0, int(record["start"]) - 1
+                    )
 
     with st.expander("Read the full transcript"):
         if not records:
@@ -158,11 +270,11 @@ if transcript_path.exists():
 
         for record in records:
             st.write(
-                f"{timestamp(record['start'])} — {record['text']}"
+                f"{label(record['start'])} — {record['text']}"
             )
 
 else:
-    st.info("Click Transcribe speech to create a searchable transcript.")
+    st.info("Click Transcribe speech to prepare a transcript.")
 
 player.video(
     str(video_path),
